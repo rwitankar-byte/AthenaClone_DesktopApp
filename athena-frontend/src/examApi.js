@@ -47,6 +47,21 @@ export function getExamSession(sessionId) {
   return request(`/exam/session/${encodeURIComponent(sessionId)}`);
 }
 
+export function getExamQuestions() {
+  return request("/exam/mcq");
+}
+
+export function getExamQuestionTotal() {
+  return request("/exam/mcq/total");
+}
+
+export function saveExamAnswer({ sessionId, questionId, selectedAnswer }) {
+  return request("/exam/answer", {
+    method: "POST",
+    body: JSON.stringify({ sessionId, questionId, selectedAnswer }),
+  });
+}
+
 export function submitExamSession(sessionId) {
   return request("/exam/submit", {
     method: "POST",

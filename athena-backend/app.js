@@ -189,17 +189,35 @@ function createExamApp({ dataDir = path.join(__dirname, "data") } = {}) {
         if (session.status !== "in-progress") {
           throw new HttpError(409, "SESSION_COMPLETED", "Exam is already submitted");
         }
-        if (session.answers.some((answer) => answer.questionId === questionId)) {
-          throw new HttpError(409, "QUESTION_ALREADY_ANSWERED", "Question already answered");
-        }
         const isCorrect = selectedAnswer === question.correctAnswer;
-        session.answers.push({ questionId, selectedAnswer, isCorrect, answeredAt: new Date().toISOString() });
-        session.attempted += 1;
-        if (isCorrect) session.correct += 1;
-        else session.wrong += 1;
+        const existingAnswer = session.answers.find(
+          (answer) => answer.questionId === questionId,
+        );
+
+        if (existingAnswer) {
+          // Answers are saved immediately and may be changed before submission.
+          if (existingAnswer.isCorrect !== isCorrect) {
+            if (isCorrect) {
+              session.correct += 1;
+              session.wrong -= 1;
+            } else {
+              session.correct -= 1;
+              session.wrong += 1;
+            }
+          }
+          existingAnswer.selectedAnswer = selectedAnswer;
+          existingAnswer.isCorrect = isCorrect;
+          existingAnswer.answeredAt = new Date().toISOString();
+        } else {
+          session.answers.push({ questionId, selectedAnswer, isCorrect, answeredAt: new Date().toISOString() });
+          session.attempted += 1;
+          if (isCorrect) session.correct += 1;
+          else session.wrong += 1;
+        }
         return { isCorrect, attempted: session.attempted, correct: session.correct, wrong: session.wrong };
       });
-      res.json({ message: "Answer saved", ...result });
+      const { isCorrect: _isCorrect, ...publicResult } = result;
+      res.json({ message: "Answer saved", ...publicResult });
     } catch (error) {
       next(error);
     }

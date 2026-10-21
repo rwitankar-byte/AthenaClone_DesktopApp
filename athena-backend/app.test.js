@@ -51,6 +51,44 @@ test("creates a session and returns its public status", async () => {
     const question = await questionResponse.json();
     assert.equal(questionResponse.status, 200);
     assert.equal(Object.hasOwn(question, "correctAnswer"), false);
+
+    const firstAnswerResponse = await fetch(`${baseUrl}/exam/answer`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        sessionId: started.sessionId,
+        questionId: 1,
+        selectedAnswer: 0,
+      }),
+    });
+    assert.equal(firstAnswerResponse.status, 200);
+
+    const changedAnswerResponse = await fetch(`${baseUrl}/exam/answer`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        sessionId: started.sessionId,
+        questionId: 1,
+        selectedAnswer: 1,
+      }),
+    });
+    const changedAnswer = await changedAnswerResponse.json();
+    assert.equal(changedAnswerResponse.status, 200);
+    assert.equal(Object.hasOwn(changedAnswer, "isCorrect"), false);
+    assert.equal(changedAnswer.attempted, 1);
+    assert.equal(changedAnswer.correct, 1);
+
+    const updatedSession = await (
+      await fetch(`${baseUrl}/exam/session/${encodeURIComponent(started.sessionId)}`)
+    ).json();
+    assert.equal(updatedSession.answers.length, 1);
+    assert.equal(updatedSession.answers[0].selectedAnswer, 1);
+    assert.equal(Object.hasOwn(updatedSession.answers[0], "isCorrect"), false);
+
+    const invalidSessionResponse = await fetch(`${baseUrl}/exam/session/not-valid`);
+    const invalidSession = await invalidSessionResponse.json();
+    assert.equal(invalidSessionResponse.status, 400);
+    assert.equal(invalidSession.error.code, "INVALID_SESSION_ID");
   } finally {
     await new Promise((resolve, reject) =>
       server.close((error) => (error ? reject(error) : resolve())),

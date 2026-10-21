@@ -145,7 +145,6 @@ Example response:
 ```json
 {
   "message": "Answer saved",
-  "isCorrect": true,
   "attempted": 1,
   "correct": 1,
   "wrong": 0

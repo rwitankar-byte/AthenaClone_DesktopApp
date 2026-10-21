@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  getExamQuestionTotal,
+  getExamQuestions,
   getExamSession,
+  saveExamAnswer,
   startExamSession,
   submitExamSession,
 } from "./examApi";
@@ -114,6 +117,8 @@ function App() {
   const examTimerIntervalRef = useRef(null);
   const examStartInFlightRef = useRef(false);
   const examExpiryHandledRef = useRef(false);
+  const answerInFlightRef = useRef(new Set());
+  const submissionInFlightRef = useRef(false);
   const lastViolationAtRef = useRef(new Map());
   const [cameraStatus, setCameraStatus] = useState(
     CAMERA_STATUS.NOT_CONFIGURED,
@@ -129,6 +134,16 @@ function App() {
     readStoredSessionId() ? "checking" : "not-connected",
   );
   const [backendError, setBackendError] = useState("");
+  const [questions, setQuestions] = useState([]);
+  const [questionCount, setQuestionCount] = useState(0);
+  const [questionIndex, setQuestionIndex] = useState(0);
+  const [answers, setAnswers] = useState({});
+  const [questionsLoading, setQuestionsLoading] = useState(false);
+  const [questionError, setQuestionError] = useState("");
+  const [answerSavingId, setAnswerSavingId] = useState(null);
+  const [submissionWarning, setSubmissionWarning] = useState(0);
+  const [submissionInFlight, setSubmissionInFlight] = useState(false);
+  const [examResult, setExamResult] = useState(null);
   const [examActive, setExamActive] = useState(false);
   const [captureStatus, setCaptureStatus] = useState(
     "Snapshots are off until you start the exam.",
@@ -195,7 +210,8 @@ function App() {
         setBackendStatus("connected");
         return true;
       }
-      await submitExamSession(sessionId);
+      const submission = await submitExamSession(sessionId);
+      setExamResult(submission.result);
       setBackendStatus("connected");
       return true;
     } catch (error) {
@@ -314,8 +330,21 @@ function App() {
 
     let current = true;
     getExamSession(sessionId)
-      .then(() => {
-        if (current) setBackendStatus("connected");
+      .then((session) => {
+        if (!current) return;
+        setBackendStatus("connected");
+        setAnswers(
+          Object.fromEntries(
+            session.answers.map((answer) => [answer.questionId, answer.selectedAnswer]),
+          ),
+        );
+        if (session.status === "submitted") {
+          setExamResult({
+            attempted: session.attempted,
+            correct: session.correct,
+            wrong: session.wrong,
+          });
+        }
       })
       .catch((error) => {
         if (!current) return;
@@ -327,6 +356,43 @@ function App() {
       current = false;
     };
   }, [sessionId]);
+
+  useEffect(() => {
+    if (
+      !sessionId ||
+      backendStatus !== "connected" ||
+      examTimerState.status !== "active"
+    ) {
+      return undefined;
+    }
+
+    let current = true;
+    const loadQuestions = setTimeout(() => {
+      setQuestionsLoading(true);
+      setQuestionError("");
+      Promise.all([getExamQuestionTotal(), getExamQuestions()])
+        .then(([totalResponse, questionResponse]) => {
+          if (!current) return;
+          if (!Array.isArray(questionResponse) || questionResponse.length === 0) {
+            throw new Error("The backend returned no exam questions");
+          }
+          setQuestionCount(totalResponse?.total ?? questionResponse.length);
+          setQuestions(questionResponse);
+          setQuestionIndex((index) => Math.min(index, questionResponse.length - 1));
+        })
+        .catch((error) => {
+          if (current) setQuestionError(error.message);
+        })
+        .finally(() => {
+          if (current) setQuestionsLoading(false);
+        });
+    }, 0);
+
+    return () => {
+      current = false;
+      clearTimeout(loadQuestions);
+    };
+  }, [backendStatus, examTimerState.status, sessionId]);
 
   useEffect(() => {
     if (examTimerState.status !== "submitted" || !sessionId) return;
@@ -565,10 +631,86 @@ function App() {
     }
   }
 
-  async function endExam() {
-    const nextState = await finishExam("manual");
-    if (nextState) setCaptureStatus("Snapshots stopped because the exam ended.");
+  function selectAnswer(questionId, selectedAnswer) {
+    if (
+      examTimerState.status !== "active" ||
+      !sessionId ||
+      answerInFlightRef.current.has(questionId)
+    ) {
+      return;
+    }
+
+    const previousAnswer = answers[questionId];
+    answerInFlightRef.current.add(questionId);
+    setAnswerSavingId(questionId);
+    setAnswers((current) => ({ ...current, [questionId]: selectedAnswer }));
+
+    saveExamAnswer({ sessionId, questionId, selectedAnswer })
+      .then(() => setQuestionError(""))
+      .catch((error) => {
+        setAnswers((current) => {
+          const restored = { ...current };
+          if (previousAnswer === undefined) delete restored[questionId];
+          else restored[questionId] = previousAnswer;
+          return restored;
+        });
+        setQuestionError(`Answer could not be saved: ${error.message}`);
+      })
+      .finally(() => {
+        answerInFlightRef.current.delete(questionId);
+        setAnswerSavingId((current) =>
+          current === questionId ? null : current,
+        );
+      });
   }
+
+  function goToQuestion(index) {
+    if (questions.length === 0) return;
+    setQuestionIndex(Math.max(0, Math.min(index, questions.length - 1)));
+  }
+
+  async function completeSubmission() {
+    if (submissionInFlightRef.current || !sessionId) return;
+    submissionInFlightRef.current = true;
+    setSubmissionInFlight(true);
+    setSubmissionWarning(0);
+    setQuestionError("");
+    try {
+      const submission = await submitExamSession(sessionId);
+      setExamResult(submission.result);
+      const nextState = await finishExam("manual");
+      if (nextState) setCaptureStatus("Exam submitted; snapshots stopped.");
+    } catch (error) {
+      setQuestionError(`Exam submission failed: ${error.message}`);
+    } finally {
+      submissionInFlightRef.current = false;
+      setSubmissionInFlight(false);
+    }
+  }
+
+  function requestSubmission() {
+    const unansweredCount = questions.filter(
+      (question) => answers[question.id] === undefined,
+    ).length;
+    if (unansweredCount > 0) {
+      setSubmissionWarning(unansweredCount);
+      const firstUnanswered = questions.findIndex(
+        (question) => answers[question.id] === undefined,
+      );
+      if (firstUnanswered >= 0) setQuestionIndex(firstUnanswered);
+      return;
+    }
+    void completeSubmission();
+  }
+
+  function endExam() {
+    requestSubmission();
+  }
+
+  const currentQuestion = questions[questionIndex];
+  const answeredCount = questions.filter(
+    (question) => answers[question.id] !== undefined,
+  ).length;
 
   return (
     <main className="min-h-screen bg-slate-950 px-6 py-12 text-slate-100">
@@ -726,6 +868,13 @@ function App() {
             </div>
           )}
 
+          {examResult && examTimerState.status === "submitted" && (
+            <p className="rounded-lg border border-emerald-400/40 bg-emerald-950/20 p-4 text-sm text-emerald-100">
+              Result: {examResult.attempted} attempted, {examResult.correct} correct, {examResult.wrong} wrong.
+              Correct answers are not revealed in this exam view.
+            </p>
+          )}
+
           {timerError && (
             <p aria-live="assertive" className="text-sm text-rose-300">
               {timerError}
@@ -833,6 +982,182 @@ function App() {
             </div>
           )}
         </section>
+
+        {examTimerState.status === "active" && (
+          <section
+            aria-labelledby="exam-question-title"
+            className="space-y-6 rounded-2xl border border-cyan-400/30 bg-slate-900 p-6 shadow-xl"
+          >
+            <div className="flex flex-wrap items-start justify-between gap-4">
+              <div>
+                <p className="text-sm font-semibold uppercase tracking-[0.16em] text-cyan-400">
+                  Examination
+                </p>
+                <h2 id="exam-question-title" className="mt-1 text-2xl font-semibold">
+                  {questionCount || questions.length} questions
+                </h2>
+                <p className="mt-1 text-sm text-slate-400">
+                  {answeredCount} answered · answers save immediately and can be changed
+                  before submission.
+                </p>
+              </div>
+              <div className="rounded-lg border border-cyan-400/40 px-4 py-2 text-right">
+                <p className="text-xs uppercase tracking-wide text-slate-400">Time left</p>
+                <p className="font-mono text-2xl text-cyan-300">
+                  {formatTimeLeft(remainingMs)}
+                </p>
+              </div>
+            </div>
+
+            {questionsLoading && (
+              <p aria-live="polite" className="text-sm text-slate-300">
+                Loading exam questions…
+              </p>
+            )}
+            {questionError && (
+              <div role="alert" className="rounded-lg border border-rose-400/50 bg-rose-950/30 p-4 text-sm text-rose-200">
+                {questionError}
+              </div>
+            )}
+            {!questionsLoading && !questionError && questions.length === 0 && (
+              <p className="rounded-lg border border-amber-400/50 bg-amber-950/20 p-4 text-sm text-amber-100">
+                No questions are available for this session. Submission is disabled until
+                the backend provides an exam.
+              </p>
+            )}
+
+            {currentQuestion && (
+              <>
+                <div className="space-y-5 rounded-xl border border-slate-700 bg-slate-950/50 p-5">
+                  <div className="flex items-center justify-between gap-3 text-sm text-slate-400">
+                    <span>
+                      Question {questionIndex + 1} of {questions.length}
+                    </span>
+                    <span>
+                      {answers[currentQuestion.id] === undefined ? "Unanswered" : "Answered"}
+                    </span>
+                  </div>
+                  <h3 className="text-xl font-medium leading-relaxed text-slate-100">
+                    {currentQuestion.question}
+                  </h3>
+                  <fieldset className="space-y-3">
+                    <legend className="sr-only">Answer options</legend>
+                    {currentQuestion.options.map((option, optionIndex) => {
+                      const selected = answers[currentQuestion.id] === optionIndex;
+                      return (
+                        <label
+                          key={`${currentQuestion.id}-${optionIndex}`}
+                          className={`flex cursor-pointer items-start gap-3 rounded-lg border p-4 transition ${
+                            selected
+                              ? "border-cyan-400 bg-cyan-400/10"
+                              : "border-slate-700 hover:border-slate-500"
+                          }`}
+                        >
+                          <input
+                            type="radio"
+                            name={`question-${currentQuestion.id}`}
+                            checked={selected}
+                            onChange={() => selectAnswer(currentQuestion.id, optionIndex)}
+                            disabled={answerSavingId === currentQuestion.id}
+                            className="mt-1 accent-cyan-400"
+                          />
+                          <span className="text-slate-200">{option}</span>
+                        </label>
+                      );
+                    })}
+                  </fieldset>
+                  <p aria-live="polite" className="min-h-5 text-sm text-slate-400">
+                    {answerSavingId === currentQuestion.id ? "Saving answer…" : ""}
+                  </p>
+                </div>
+
+                <nav aria-label="Question palette" className="space-y-3">
+                  <div className="flex flex-wrap gap-2">
+                    {questions.map((question, index) => {
+                      const answered = answers[question.id] !== undefined;
+                      const current = index === questionIndex;
+                      return (
+                        <button
+                          key={question.id}
+                          type="button"
+                          aria-label={`Question ${index + 1}${answered ? ", answered" : ", unanswered"}`}
+                          aria-current={current ? "step" : undefined}
+                          onClick={() => goToQuestion(index)}
+                          className={`h-10 w-10 rounded-lg border text-sm font-semibold transition ${
+                            current
+                              ? "border-cyan-300 bg-cyan-400 text-slate-950"
+                              : answered
+                                ? "border-emerald-400/70 bg-emerald-400/10 text-emerald-200"
+                                : "border-slate-600 text-slate-400 hover:border-slate-400"
+                          }`}
+                        >
+                          {index + 1}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <p className="text-xs text-slate-500">
+                    Palette: cyan is current, green is answered, and gray is unanswered.
+                  </p>
+                </nav>
+
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <button
+                    type="button"
+                    onClick={() => goToQuestion(questionIndex - 1)}
+                    disabled={questionIndex === 0}
+                    className="rounded-lg border border-slate-600 px-4 py-2 font-semibold text-slate-200 transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    Previous
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => goToQuestion(questionIndex + 1)}
+                    disabled={questionIndex === questions.length - 1}
+                    className="rounded-lg border border-slate-600 px-4 py-2 font-semibold text-slate-200 transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    Next
+                  </button>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={requestSubmission}
+                  disabled={submissionInFlight}
+                  className="w-full rounded-lg bg-rose-400 px-4 py-3 font-semibold text-slate-950 transition hover:bg-rose-300 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  Submit exam
+                </button>
+              </>
+            )}
+
+            {submissionWarning > 0 && (
+              <div role="alert" className="space-y-3 rounded-lg border border-amber-400/50 bg-amber-950/30 p-4">
+                <p className="text-sm text-amber-100">
+                  {submissionWarning} question{submissionWarning === 1 ? " remains" : "s remain"} unanswered.
+                  You can review them or submit anyway.
+                </p>
+                <div className="flex flex-wrap gap-3">
+                  <button
+                    type="button"
+                    onClick={() => setSubmissionWarning(0)}
+                    className="rounded-lg border border-slate-600 px-4 py-2 text-sm font-semibold text-slate-200"
+                  >
+                    Review questions
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void completeSubmission()}
+                    className="rounded-lg bg-amber-400 px-4 py-2 text-sm font-semibold text-slate-950"
+                  >
+                    Submit anyway
+                  </button>
+                </div>
+              </div>
+            )}
+
+          </section>
+        )}
       </section>
     </main>
   );
