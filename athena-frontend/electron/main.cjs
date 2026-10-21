@@ -1,9 +1,11 @@
 const { BrowserWindow, app, ipcMain } = require("electron");
 const path = require("node:path");
+const { saveSnapshot } = require("./snapshot.cjs");
 
 const IPC_CHANNELS = Object.freeze({
   getAppInfo: "app:get-info",
   setFullscreen: "window:set-fullscreen",
+  saveSnapshot: "proctoring:save-snapshot",
 });
 
 let mainWindow = null;
@@ -43,6 +45,12 @@ function registerIpcHandlers() {
 
     mainWindow.setFullScreen(enabled);
     return mainWindow.isFullScreen();
+  });
+
+  ipcMain.handle(IPC_CHANNELS.saveSnapshot, async (event, payload) => {
+    assertTrustedSender(event);
+    await saveSnapshot(app, payload);
+    return { saved: true };
   });
 
   ipcHandlersRegistered = true;
