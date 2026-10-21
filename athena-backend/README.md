@@ -11,6 +11,7 @@ exam-backend/
 ├── data/
 │   ├── questions.json
 │   └── sessions.json
+├── app.js
 ├── package.json
 ├── server.js
 └── README.md
@@ -27,6 +28,14 @@ Server runs at:
 
 ```text
 http://localhost:3000
+```
+
+Set `EXAM_BACKEND_PORT` or `PORT` to use another port. The frontend can point
+to that server with `VITE_EXAM_BACKEND_URL`.
+
+Run the session integration check with:
+```bash
+npm test
 ```
 
 ## API Flow
@@ -211,3 +220,11 @@ sessions.json  = exam session database
 ```
 
 Later these can be replaced with a real database without changing the basic API idea.
+
+The backend reads and writes JSON asynchronously. Session updates are
+serialized in-process and written through a temporary file before rename. This
+is suitable for the single backend process used by this desktop app; use a
+database transaction before running multiple backend processes.
+
+Session status responses omit per-answer `isCorrect` values, and question
+responses never include `correctAnswer`.

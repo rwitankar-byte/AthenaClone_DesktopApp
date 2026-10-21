@@ -1,4 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  getExamSession,
+  startExamSession,
+  submitExamSession,
+} from "./examApi";
 
 const CAMERA_STATUS = {
   NOT_CONFIGURED: "not-configured",
@@ -13,6 +18,22 @@ function formatTimeLeft(remainingMs) {
   const hours = Math.floor(totalMinutes / 60);
   const minutes = totalMinutes % 60;
   return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
+}
+
+function readStoredSessionId() {
+  try {
+    return localStorage.getItem("athena.examSessionId") || "";
+  } catch {
+    return "";
+  }
+}
+
+function storeSessionId(sessionId) {
+  try {
+    localStorage.setItem("athena.examSessionId", sessionId);
+  } catch {
+    // Session recovery is best effort; the backend remains authoritative.
+  }
 }
 
 function stopMediaStream(stream) {
@@ -101,6 +122,13 @@ function App() {
     "Camera access has not been requested.",
   );
   const [rulesAccepted, setRulesAccepted] = useState(false);
+  const [studentId, setStudentId] = useState("");
+  const [studentName, setStudentName] = useState("");
+  const [sessionId, setSessionId] = useState(readStoredSessionId);
+  const [backendStatus, setBackendStatus] = useState(
+    readStoredSessionId() ? "checking" : "not-connected",
+  );
+  const [backendError, setBackendError] = useState("");
   const [examActive, setExamActive] = useState(false);
   const [captureStatus, setCaptureStatus] = useState(
     "Snapshots are off until you start the exam.",
@@ -158,6 +186,24 @@ function App() {
       return null;
     }
   }, [applyExamTimerState]);
+
+  const submitBackendSession = useCallback(async () => {
+    if (!sessionId) return true;
+    try {
+      const currentSession = await getExamSession(sessionId);
+      if (currentSession.status === "submitted") {
+        setBackendStatus("connected");
+        return true;
+      }
+      await submitExamSession(sessionId);
+      setBackendStatus("connected");
+      return true;
+    } catch (error) {
+      setBackendStatus("error");
+      setBackendError(error.message);
+      return false;
+    }
+  }, [sessionId]);
 
   const recordViolation = useCallback((type) => {
     const now = Date.now();
@@ -262,6 +308,31 @@ function App() {
       unsubscribe?.();
     };
   }, [applyExamTimerState]);
+
+  useEffect(() => {
+    if (!sessionId) return undefined;
+
+    let current = true;
+    getExamSession(sessionId)
+      .then(() => {
+        if (current) setBackendStatus("connected");
+      })
+      .catch((error) => {
+        if (!current) return;
+        setBackendStatus("error");
+        setBackendError(error.message);
+      });
+
+    return () => {
+      current = false;
+    };
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (examTimerState.status !== "submitted" || !sessionId) return;
+    const retry = setTimeout(() => void submitBackendSession(), 0);
+    return () => clearTimeout(retry);
+  }, [examTimerState.status, sessionId, submitBackendSession]);
 
   useEffect(() => {
     if (examTimerIntervalRef.current !== null) {
@@ -406,6 +477,7 @@ function App() {
     if (
       !examActive ||
       examTimerState.status !== "active" ||
+      backendStatus !== "connected" ||
       !rulesAccepted ||
       !cameraReady ||
       !streamRef.current
@@ -455,7 +527,7 @@ function App() {
       if (captureTimerRef.current === timer) captureTimerRef.current = null;
       captureGenerationRef.current += 1;
     };
-  }, [cameraReady, examActive, examTimerState.status, rulesAccepted]);
+  }, [backendStatus, cameraReady, examActive, examTimerState.status, rulesAccepted]);
 
   async function startExam() {
     if (examStartInFlightRef.current || examTimerState.status === "active") return;
@@ -463,14 +535,30 @@ function App() {
       setFullscreenError("Enter fullscreen before starting the exam.");
       return;
     }
+    if (!studentId.trim() || !studentName.trim()) {
+      setBackendError("Enter your student ID and name before starting the exam.");
+      return;
+    }
 
     examStartInFlightRef.current = true;
     setTimerError("");
+    setBackendError("");
+    setBackendStatus("connecting");
     try {
+      const session = await startExamSession({
+        userId: studentId.trim(),
+        name: studentName.trim(),
+      });
+      if (!session?.sessionId) throw new Error("The backend returned no session ID");
+      setSessionId(session.sessionId);
+      storeSessionId(session.sessionId);
+      setBackendStatus("connected");
       const nextState = await window.electronAPI.startExamTimer();
       applyExamTimerState(nextState);
       setCaptureStatus("Exam active; snapshots save locally every five seconds.");
     } catch {
+      setBackendStatus("error");
+      setBackendError("The exam session could not be created. Check the backend and try again.");
       setTimerError("The exam could not be started. Please try again.");
     } finally {
       examStartInFlightRef.current = false;
@@ -643,6 +731,39 @@ function App() {
               {timerError}
             </p>
           )}
+
+          <div className="grid gap-3 md:grid-cols-2">
+            <label className="space-y-2 text-sm text-slate-300">
+              <span>Student ID</span>
+              <input
+                value={studentId}
+                onChange={(event) => setStudentId(event.target.value)}
+                disabled={examActive}
+                autoComplete="username"
+                className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-slate-100 outline-none focus:border-cyan-400 disabled:opacity-60"
+                placeholder="e.g. student-101"
+              />
+            </label>
+            <label className="space-y-2 text-sm text-slate-300">
+              <span>Name</span>
+              <input
+                value={studentName}
+                onChange={(event) => setStudentName(event.target.value)}
+                disabled={examActive}
+                autoComplete="name"
+                className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-slate-100 outline-none focus:border-cyan-400 disabled:opacity-60"
+                placeholder="Your full name"
+              />
+            </label>
+          </div>
+
+          <div aria-live="polite" className="rounded-lg border border-slate-700 bg-slate-950/60 p-4 text-sm">
+            <p className="font-medium">Backend: {backendStatus.replace("-", " ")}</p>
+            <p className="mt-1 text-slate-400">
+              {sessionId ? `Session: ${sessionId}` : "A session will be created when the exam starts."}
+            </p>
+            {backendError && <p className="mt-1 text-rose-300">{backendError}</p>}
+          </div>
 
           <label className="flex items-start gap-3 text-sm text-slate-300">
             <input
