@@ -6,6 +6,8 @@ const IPC_CHANNELS = Object.freeze({
   getAppInfo: "app:get-info",
   setFullscreen: "window:set-fullscreen",
   saveSnapshot: "proctoring:save-snapshot",
+  getWindowState: "window:get-state",
+  windowStateChanged: "window:state-changed",
 });
 
 let mainWindow = null;
@@ -43,8 +45,20 @@ function registerIpcHandlers() {
       throw new TypeError("setFullscreen requires a boolean");
     }
 
+    // Native fullscreen can transition asynchronously, especially on macOS;
+    // the window events below are the authoritative state updates.
     mainWindow.setFullScreen(enabled);
     return mainWindow.isFullScreen();
+  });
+
+  ipcMain.handle(IPC_CHANNELS.getWindowState, (event, ...args) => {
+    assertTrustedSender(event);
+    if (args.length !== 0) throw new TypeError("getWindowState accepts no arguments");
+
+    return {
+      fullscreen: mainWindow.isFullScreen(),
+      focused: mainWindow.isFocused(),
+    };
   });
 
   ipcMain.handle(IPC_CHANNELS.saveSnapshot, async (event, payload) => {
@@ -54,6 +68,15 @@ function registerIpcHandlers() {
   });
 
   ipcHandlersRegistered = true;
+}
+
+function sendWindowState() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  // Fullscreen is a window state, not kiosk mode; focus changes are signals only.
+  mainWindow.webContents.send(IPC_CHANNELS.windowStateChanged, {
+    fullscreen: mainWindow.isFullScreen(),
+    focused: mainWindow.isFocused(),
+  });
 }
 
 function isAllowedNavigation(url) {
@@ -94,6 +117,10 @@ function createWindow() {
   mainWindow.on("closed", () => {
     mainWindow = null;
   });
+  mainWindow.on("enter-full-screen", sendWindowState);
+  mainWindow.on("leave-full-screen", sendWindowState);
+  mainWindow.on("focus", sendWindowState);
+  mainWindow.on("blur", sendWindowState);
 
   mainWindow.webContents.on("will-navigate", (event, url) => {
     if (!isAllowedNavigation(url)) event.preventDefault();

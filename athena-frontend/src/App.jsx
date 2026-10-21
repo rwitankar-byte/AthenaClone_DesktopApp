@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 const CAMERA_STATUS = {
   NOT_CONFIGURED: "not-configured",
@@ -82,6 +82,8 @@ function App() {
   const captureTimerRef = useRef(null);
   const captureInFlightRef = useRef(false);
   const captureGenerationRef = useRef(0);
+  const examActiveRef = useRef(false);
+  const lastViolationAtRef = useRef(new Map());
   const [cameraStatus, setCameraStatus] = useState(
     CAMERA_STATUS.NOT_CONFIGURED,
   );
@@ -93,6 +95,72 @@ function App() {
   const [captureStatus, setCaptureStatus] = useState(
     "Snapshots are off until you start the exam.",
   );
+  const [fullscreen, setFullscreen] = useState(false);
+  const [fullscreenRequesting, setFullscreenRequesting] = useState(false);
+  const [fullscreenError, setFullscreenError] = useState("");
+  const [fullscreenRecoveryRequired, setFullscreenRecoveryRequired] =
+    useState(false);
+  const [violations, setViolations] = useState([]);
+
+  const recordViolation = useCallback((type) => {
+    const now = Date.now();
+    const lastDetectedAt = lastViolationAtRef.current.get(type) || 0;
+    if (now - lastDetectedAt < 1000) return;
+    lastViolationAtRef.current.set(type, now);
+
+    const id =
+      typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+        ? crypto.randomUUID()
+        : `${now}-${type}`;
+    setViolations((current) => [
+      ...current.slice(-99),
+      {
+        id,
+        type,
+        detectedAt: new Date(now).toISOString(),
+        confirmed: false,
+      },
+    ]);
+  }, []);
+
+  useEffect(() => {
+    examActiveRef.current = examActive;
+  }, [examActive]);
+
+  useEffect(() => {
+    if (!window.electronAPI?.onWindowStateChange) return undefined;
+
+    function handleWindowStateChange(state) {
+      if (
+        !state ||
+        typeof state.fullscreen !== "boolean" ||
+        typeof state.focused !== "boolean"
+      ) {
+        return;
+      }
+
+      setFullscreen(state.fullscreen);
+      if (!examActiveRef.current) return;
+
+      if (!state.fullscreen) {
+        recordViolation("fullscreen-exit");
+        setFullscreenRecoveryRequired(true);
+      } else {
+        setFullscreenRecoveryRequired(false);
+      }
+      if (!state.focused) recordViolation("window-focus-loss");
+    }
+
+    const unsubscribe = window.electronAPI.onWindowStateChange(
+      handleWindowStateChange,
+    );
+    window.electronAPI
+      .getWindowState?.()
+      .then(handleWindowStateChange)
+      .catch(() => undefined);
+
+    return () => unsubscribe?.();
+  }, [recordViolation]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -101,6 +169,7 @@ function App() {
     return () => {
       mountedRef.current = false;
       requestInFlightRef.current = false;
+      examActiveRef.current = false;
       requestIdRef.current += 1;
       stopSnapshotTimer(captureTimerRef, captureGenerationRef);
       const stream = streamRef.current;
@@ -162,6 +231,7 @@ function App() {
       stream.getVideoTracks()[0].addEventListener("ended", () => {
         if (!mountedRef.current || streamRef.current !== stream) return;
         stopSnapshotTimer(captureTimerRef, captureGenerationRef);
+        examActiveRef.current = false;
         setExamActive(false);
         streamRef.current = null;
         imageCaptureRef.current = null;
@@ -189,6 +259,7 @@ function App() {
     requestInFlightRef.current = false;
     requestIdRef.current += 1;
     stopSnapshotTimer(captureTimerRef, captureGenerationRef);
+    examActiveRef.current = false;
     setExamActive(false);
     const stream = streamRef.current;
     streamRef.current = null;
@@ -201,6 +272,24 @@ function App() {
 
   const cameraReady = cameraStatus === CAMERA_STATUS.READY;
   const cameraRequesting = cameraStatus === CAMERA_STATUS.REQUESTING;
+
+  async function enterFullscreen() {
+    if (!window.electronAPI?.setFullscreen) {
+      setFullscreenError("Fullscreen controls are unavailable in this environment.");
+      return;
+    }
+
+    setFullscreenRequesting(true);
+    setFullscreenError("");
+    try {
+      const isFullscreen = await window.electronAPI.setFullscreen(true);
+      setFullscreen(Boolean(isFullscreen));
+    } catch {
+      setFullscreenError("Fullscreen could not be enabled. Please try again.");
+    } finally {
+      setFullscreenRequesting(false);
+    }
+  }
 
   useEffect(() => {
     if (!examActive || !rulesAccepted || !cameraReady || !streamRef.current) {
@@ -252,14 +341,20 @@ function App() {
   }, [cameraReady, examActive, rulesAccepted]);
 
   function startExam() {
-    if (!cameraReady || !rulesAccepted) return;
+    if (!cameraReady || !rulesAccepted || !fullscreen) {
+      setFullscreenError("Enter fullscreen before starting the exam.");
+      return;
+    }
+    examActiveRef.current = true;
     setCaptureStatus("Starting local snapshots every five seconds…");
     setExamActive(true);
   }
 
   function endExam() {
     stopSnapshotTimer(captureTimerRef, captureGenerationRef);
+    examActiveRef.current = false;
     setExamActive(false);
+    setFullscreenRecoveryRequired(false);
     setCaptureStatus("Snapshots stopped because the exam ended.");
   }
 
@@ -342,6 +437,49 @@ function App() {
 
         <section className="space-y-5 rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-xl">
           <div>
+            <h2 className="text-xl font-semibold">Exam fullscreen</h2>
+            <p className="mt-2 text-sm text-slate-400">
+              Enter the normal application fullscreen before starting. Athena
+              does not use kiosk mode and cannot prevent every operating-system
+              shortcut or access to another application.
+            </p>
+          </div>
+
+          <div
+            aria-live="polite"
+            className={`rounded-lg border p-4 ${
+              fullscreenRecoveryRequired
+                ? "border-rose-400/60 bg-rose-950/30"
+                : "border-slate-700 bg-slate-950/60"
+            }`}
+          >
+            <p className="text-sm font-medium">
+              Status: {fullscreen ? "fullscreen ready" : "not fullscreen"}
+            </p>
+            <p className="mt-1 text-sm text-slate-400">
+              {fullscreenRecoveryRequired
+                ? "Fullscreen was exited during the active exam. This is a detected event, not proof of cheating. Re-enter fullscreen to continue."
+                : fullscreenError ||
+                  "Fullscreen is required before the exam can start."}
+            </p>
+          </div>
+
+          <button
+            type="button"
+            onClick={enterFullscreen}
+            disabled={fullscreenRequesting || (fullscreen && !fullscreenRecoveryRequired)}
+            className="rounded-lg bg-indigo-400 px-4 py-2 font-semibold text-slate-950 transition hover:bg-indigo-300 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {fullscreenRequesting
+              ? "Entering fullscreen…"
+              : fullscreenRecoveryRequired
+                ? "Re-enter fullscreen"
+                : "Enter fullscreen"}
+          </button>
+        </section>
+
+        <section className="space-y-5 rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-xl">
+          <div>
             <h2 className="text-xl font-semibold">Proctoring rules</h2>
             <p className="mt-2 text-sm text-slate-400">
               During the active exam, one camera snapshot is saved locally
@@ -369,7 +507,7 @@ function App() {
               <button
                 type="button"
                 onClick={startExam}
-                disabled={!cameraReady || !rulesAccepted}
+                disabled={!cameraReady || !rulesAccepted || !fullscreen}
                 className="rounded-lg bg-cyan-400 px-4 py-2 font-semibold text-slate-950 transition hover:bg-cyan-300 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 Start proctored exam
@@ -387,6 +525,32 @@ function App() {
               {examActive ? captureStatus : "Snapshots are currently off."}
             </p>
           </div>
+
+          {violations.length > 0 && (
+            <div className="space-y-3 rounded-lg border border-amber-400/40 bg-amber-950/20 p-4">
+              <div>
+                <h3 className="font-semibold text-amber-200">
+                  Detected proctoring events
+                </h3>
+                <p className="mt-1 text-sm text-amber-100/70">
+                  These are observations for review, not automatic cheating
+                  findings.
+                </p>
+              </div>
+              <ul className="space-y-1 text-sm text-slate-300">
+                {violations.slice(-5).map((event) => (
+                  <li key={event.id}>
+                    {event.type === "fullscreen-exit"
+                      ? "Fullscreen exited"
+                      : "Window focus lost"}{" "}
+                    <time dateTime={event.detectedAt}>
+                      {new Date(event.detectedAt).toLocaleTimeString()}
+                    </time>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
         </section>
       </section>
     </main>
