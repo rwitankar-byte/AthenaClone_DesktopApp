@@ -6,7 +6,7 @@
   "main": "./electron/main.cjs",
   "scripts": {
     "dev:react": "vite",
-    "dev:electron":"electron .",
+    "dev:electron": "electron .",
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview"
