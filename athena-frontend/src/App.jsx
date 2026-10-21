@@ -119,6 +119,7 @@ function App() {
   const examExpiryHandledRef = useRef(false);
   const answerInFlightRef = useRef(new Set());
   const submissionInFlightRef = useRef(false);
+  const backendFinalizationPromiseRef = useRef(null);
   const lastViolationAtRef = useRef(new Map());
   const [cameraStatus, setCameraStatus] = useState(
     CAMERA_STATUS.NOT_CONFIGURED,
@@ -142,8 +143,10 @@ function App() {
   const [questionError, setQuestionError] = useState("");
   const [answerSavingId, setAnswerSavingId] = useState(null);
   const [submissionWarning, setSubmissionWarning] = useState(0);
+  const [submissionConfirmation, setSubmissionConfirmation] = useState(false);
   const [submissionInFlight, setSubmissionInFlight] = useState(false);
   const [examResult, setExamResult] = useState(null);
+  const [finalizationStatus, setFinalizationStatus] = useState("idle");
   const [examActive, setExamActive] = useState(false);
   const [captureStatus, setCaptureStatus] = useState(
     "Snapshots are off until you start the exam.",
@@ -182,6 +185,9 @@ function App() {
       examActiveRef.current = false;
       setExamActive(false);
       setFullscreenRecoveryRequired(false);
+      setFinalizationStatus((current) =>
+        current === "succeeded" ? current : "pending",
+      );
       if (!examExpiryHandledRef.current && nextState.completionReason === "time-expired") {
         examExpiryHandledRef.current = true;
         setCaptureStatus("Time expired; the exam was submitted automatically.");
@@ -202,24 +208,62 @@ function App() {
     }
   }, [applyExamTimerState]);
 
-  const submitBackendSession = useCallback(async () => {
-    if (!sessionId) return true;
-    try {
+  const finalizeBackendSession = useCallback(() => {
+    if (!sessionId) return Promise.reject(new Error("No exam session is available"));
+    // Share one finalization promise so timer expiry, clicks, and retries cannot
+    // race separate requests; the backend remains the scoring authority.
+    if (backendFinalizationPromiseRef.current) {
+      return backendFinalizationPromiseRef.current;
+    }
+
+    const request = (async () => {
       const currentSession = await getExamSession(sessionId);
       if (currentSession.status === "submitted") {
-        setBackendStatus("connected");
-        return true;
+        return {
+          attempted: currentSession.attempted,
+          correct: currentSession.correct,
+          wrong: currentSession.wrong,
+        };
       }
       const submission = await submitExamSession(sessionId);
-      setExamResult(submission.result);
+      return submission.result;
+    })();
+
+    backendFinalizationPromiseRef.current = request;
+    request.then(
+      () => {
+        if (backendFinalizationPromiseRef.current === request) {
+          backendFinalizationPromiseRef.current = null;
+        }
+      },
+      () => {
+        if (backendFinalizationPromiseRef.current === request) {
+          backendFinalizationPromiseRef.current = null;
+        }
+      },
+    );
+    return request;
+  }, [sessionId]);
+
+  const submitBackendSession = useCallback(async () => {
+    setFinalizationStatus("pending");
+    try {
+      const result = await finalizeBackendSession();
+      setExamResult(result);
+      if (examTimerState.status === "active") {
+        const localState = await finishExam("manual");
+        if (!localState) throw new Error("Local exam finalization failed");
+      }
+      setFinalizationStatus("succeeded");
       setBackendStatus("connected");
       return true;
     } catch (error) {
+      setFinalizationStatus("failed");
       setBackendStatus("error");
       setBackendError(error.message);
       return false;
     }
-  }, [sessionId]);
+  }, [examTimerState.status, finalizeBackendSession, finishExam]);
 
   const recordViolation = useCallback((type) => {
     const now = Date.now();
@@ -344,6 +388,7 @@ function App() {
             correct: session.correct,
             wrong: session.wrong,
           });
+          setFinalizationStatus("succeeded");
         }
       })
       .catch((error) => {
@@ -673,14 +718,19 @@ function App() {
     if (submissionInFlightRef.current || !sessionId) return;
     submissionInFlightRef.current = true;
     setSubmissionInFlight(true);
+    setFinalizationStatus("pending");
+    setSubmissionConfirmation(false);
     setSubmissionWarning(0);
     setQuestionError("");
     try {
-      const submission = await submitExamSession(sessionId);
-      setExamResult(submission.result);
+      const result = await finalizeBackendSession();
+      setExamResult(result);
       const nextState = await finishExam("manual");
-      if (nextState) setCaptureStatus("Exam submitted; snapshots stopped.");
+      if (!nextState) throw new Error("Local exam finalization failed");
+      setFinalizationStatus("succeeded");
+      setCaptureStatus("Exam submitted; snapshots stopped.");
     } catch (error) {
+      setFinalizationStatus("failed");
       setQuestionError(`Exam submission failed: ${error.message}`);
     } finally {
       submissionInFlightRef.current = false;
@@ -689,10 +739,15 @@ function App() {
   }
 
   function requestSubmission() {
+    if (answerInFlightRef.current.size > 0) {
+      setQuestionError("Wait for the selected answer to finish saving before submitting.");
+      return;
+    }
     const unansweredCount = questions.filter(
       (question) => answers[question.id] === undefined,
     ).length;
     if (unansweredCount > 0) {
+      setSubmissionConfirmation(false);
       setSubmissionWarning(unansweredCount);
       const firstUnanswered = questions.findIndex(
         (question) => answers[question.id] === undefined,
@@ -700,7 +755,7 @@ function App() {
       if (firstUnanswered >= 0) setQuestionIndex(firstUnanswered);
       return;
     }
-    void completeSubmission();
+    setSubmissionConfirmation(true);
   }
 
   function endExam() {
@@ -868,12 +923,67 @@ function App() {
             </div>
           )}
 
-          {examResult && examTimerState.status === "submitted" && (
-            <p className="rounded-lg border border-emerald-400/40 bg-emerald-950/20 p-4 text-sm text-emerald-100">
-              Result: {examResult.attempted} attempted, {examResult.correct} correct, {examResult.wrong} wrong.
-              Correct answers are not revealed in this exam view.
+          {examTimerState.status === "submitted" && finalizationStatus === "pending" && (
+            <p aria-live="polite" className="rounded-lg border border-amber-400/40 bg-amber-950/20 p-4 text-sm text-amber-100">
+              Exam time has ended. Saving the final result…
             </p>
           )}
+
+          {examTimerState.status === "submitted" && finalizationStatus === "failed" && (
+            <div role="alert" className="space-y-3 rounded-lg border border-rose-400/50 bg-rose-950/30 p-4 text-sm text-rose-100">
+              <p>The backend could not confirm the final result. No successful results are shown.</p>
+              <button
+                type="button"
+                onClick={() => void submitBackendSession()}
+                disabled={submissionInFlight}
+                className="rounded-lg border border-rose-300 px-4 py-2 font-semibold text-rose-100 disabled:opacity-50"
+              >
+                Retry finalization
+              </button>
+            </div>
+          )}
+
+          {examResult &&
+            examTimerState.status === "submitted" &&
+            finalizationStatus === "succeeded" && (
+              <section
+                aria-labelledby="results-title"
+                className="space-y-4 rounded-xl border border-emerald-400/40 bg-emerald-950/20 p-5"
+              >
+                <div>
+                  <p className="text-sm font-semibold uppercase tracking-[0.16em] text-emerald-300">
+                    Results
+                  </p>
+                  <h3 id="results-title" className="mt-1 text-2xl font-semibold text-emerald-50">
+                    Exam submitted successfully
+                  </h3>
+                  <p className="mt-1 text-sm text-emerald-100/80">
+                    Your final score was calculated and stored by the backend.
+                    Correct answers are not revealed in this view.
+                  </p>
+                </div>
+                <dl className="grid grid-cols-2 gap-3 text-sm md:grid-cols-4">
+                  <div className="rounded-lg bg-slate-950/40 p-3">
+                    <dt className="text-slate-400">Attempted</dt>
+                    <dd className="mt-1 text-xl font-semibold text-slate-100">{examResult.attempted}</dd>
+                  </div>
+                  <div className="rounded-lg bg-slate-950/40 p-3">
+                    <dt className="text-slate-400">Correct</dt>
+                    <dd className="mt-1 text-xl font-semibold text-emerald-300">{examResult.correct}</dd>
+                  </div>
+                  <div className="rounded-lg bg-slate-950/40 p-3">
+                    <dt className="text-slate-400">Wrong</dt>
+                    <dd className="mt-1 text-xl font-semibold text-rose-300">{examResult.wrong}</dd>
+                  </div>
+                  <div className="rounded-lg bg-slate-950/40 p-3">
+                    <dt className="text-slate-400">Unanswered</dt>
+                    <dd className="mt-1 text-xl font-semibold text-amber-300">
+                      {Math.max(0, questions.length - examResult.attempted)}
+                    </dd>
+                  </div>
+                </dl>
+              </section>
+            )}
 
           {timerError && (
             <p aria-live="assertive" className="text-sm text-rose-300">
@@ -1123,7 +1233,7 @@ function App() {
                 <button
                   type="button"
                   onClick={requestSubmission}
-                  disabled={submissionInFlight}
+                  disabled={submissionInFlight || answerSavingId !== null}
                   className="w-full rounded-lg bg-rose-400 px-4 py-3 font-semibold text-slate-950 transition hover:bg-rose-300 disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   Submit exam
@@ -1147,10 +1257,38 @@ function App() {
                   </button>
                   <button
                     type="button"
-                    onClick={() => void completeSubmission()}
+                    onClick={() => setSubmissionConfirmation(true)}
                     className="rounded-lg bg-amber-400 px-4 py-2 text-sm font-semibold text-slate-950"
                   >
                     Submit anyway
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {submissionConfirmation && (
+              <div role="alertdialog" aria-labelledby="submit-confirmation-title" className="space-y-3 rounded-lg border border-rose-400/50 bg-rose-950/30 p-4">
+                <h3 id="submit-confirmation-title" className="font-semibold text-rose-100">
+                  Submit your final exam now?
+                </h3>
+                <p className="text-sm text-rose-100/80">
+                  After confirmation, the timer and camera snapshots will stop. You cannot return to the active exam.
+                </p>
+                <div className="flex flex-wrap gap-3">
+                  <button
+                    type="button"
+                    onClick={() => setSubmissionConfirmation(false)}
+                    className="rounded-lg border border-slate-600 px-4 py-2 text-sm font-semibold text-slate-200"
+                  >
+                    Continue exam
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void completeSubmission()}
+                    disabled={submissionInFlight || answerSavingId !== null}
+                    className="rounded-lg bg-rose-400 px-4 py-2 text-sm font-semibold text-slate-950 disabled:opacity-50"
+                  >
+                    Confirm final submission
                   </button>
                 </div>
               </div>

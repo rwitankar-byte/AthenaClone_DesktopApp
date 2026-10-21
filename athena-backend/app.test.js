@@ -89,6 +89,30 @@ test("creates a session and returns its public status", async () => {
     const invalidSession = await invalidSessionResponse.json();
     assert.equal(invalidSessionResponse.status, 400);
     assert.equal(invalidSession.error.code, "INVALID_SESSION_ID");
+
+    const firstSubmitResponse = await fetch(`${baseUrl}/exam/submit`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sessionId: started.sessionId }),
+    });
+    const firstSubmit = await firstSubmitResponse.json();
+    assert.equal(firstSubmitResponse.status, 200);
+    assert.deepEqual(firstSubmit.result, { attempted: 1, correct: 1, wrong: 0 });
+
+    const secondSubmitResponse = await fetch(`${baseUrl}/exam/submit`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sessionId: started.sessionId }),
+    });
+    const secondSubmit = await secondSubmitResponse.json();
+    assert.equal(secondSubmitResponse.status, 200);
+    assert.deepEqual(secondSubmit.result, firstSubmit.result);
+
+    const submittedSession = await (
+      await fetch(`${baseUrl}/exam/session/${encodeURIComponent(started.sessionId)}`)
+    ).json();
+    assert.equal(submittedSession.status, "submitted");
+    assert.ok(submittedSession.submittedAt);
   } finally {
     await new Promise((resolve, reject) =>
       server.close((error) => (error ? reject(error) : resolve())),

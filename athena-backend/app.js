@@ -242,7 +242,9 @@ function createExamApp({ dataDir = path.join(__dirname, "data") } = {}) {
         const session = sessions.find((item) => item.sessionId === sessionId);
         if (!session) throw new HttpError(404, "SESSION_NOT_FOUND", "Session not found");
         if (session.status !== "in-progress") {
-          throw new HttpError(409, "SESSION_COMPLETED", "Exam is already submitted");
+          // Finalization is idempotent: retries return the recorded result and
+          // never replace the original submittedAt timestamp.
+          return { attempted: session.attempted, correct: session.correct, wrong: session.wrong };
         }
         session.status = "submitted";
         session.submittedAt = new Date().toISOString();
