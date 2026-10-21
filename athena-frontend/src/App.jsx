@@ -8,6 +8,13 @@ const CAMERA_STATUS = {
 };
 const SNAPSHOT_INTERVAL_MS = 5000;
 
+function formatTimeLeft(remainingMs) {
+  const totalMinutes = Math.ceil(Math.max(0, remainingMs) / 60000);
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
+}
+
 function stopMediaStream(stream) {
   stream?.getTracks().forEach((track) => track.stop());
 }
@@ -83,6 +90,9 @@ function App() {
   const captureInFlightRef = useRef(false);
   const captureGenerationRef = useRef(0);
   const examActiveRef = useRef(false);
+  const examTimerIntervalRef = useRef(null);
+  const examStartInFlightRef = useRef(false);
+  const examExpiryHandledRef = useRef(false);
   const lastViolationAtRef = useRef(new Map());
   const [cameraStatus, setCameraStatus] = useState(
     CAMERA_STATUS.NOT_CONFIGURED,
@@ -95,12 +105,59 @@ function App() {
   const [captureStatus, setCaptureStatus] = useState(
     "Snapshots are off until you start the exam.",
   );
+  const [examTimerState, setExamTimerState] = useState({ status: "idle" });
+  const [remainingMs, setRemainingMs] = useState(0);
+  const [timerError, setTimerError] = useState("");
   const [fullscreen, setFullscreen] = useState(false);
   const [fullscreenRequesting, setFullscreenRequesting] = useState(false);
   const [fullscreenError, setFullscreenError] = useState("");
   const [fullscreenRecoveryRequired, setFullscreenRecoveryRequired] =
     useState(false);
   const [violations, setViolations] = useState([]);
+
+  const applyExamTimerState = useCallback((nextState) => {
+    if (!nextState || !["idle", "active", "submitted"].includes(nextState.status)) {
+      return;
+    }
+
+    const nextRemainingMs = Number.isFinite(nextState.remainingMs)
+      ? nextState.remainingMs
+      : 0;
+    setExamTimerState(nextState);
+    setRemainingMs(nextRemainingMs);
+
+    if (nextState.status === "active") {
+      examExpiryHandledRef.current = false;
+      examActiveRef.current = true;
+      setExamActive(true);
+      if (nextState.rulesAccepted) setRulesAccepted(true);
+      return;
+    }
+
+    if (nextState.status === "submitted") {
+      stopSnapshotTimer(captureTimerRef, captureGenerationRef);
+      examActiveRef.current = false;
+      setExamActive(false);
+      setFullscreenRecoveryRequired(false);
+      if (!examExpiryHandledRef.current && nextState.completionReason === "time-expired") {
+        examExpiryHandledRef.current = true;
+        setCaptureStatus("Time expired; the exam was submitted automatically.");
+      }
+    }
+  }, []);
+
+  const finishExam = useCallback(async (reason) => {
+    if (!window.electronAPI?.finishExam) return null;
+
+    try {
+      const nextState = await window.electronAPI.finishExam(reason);
+      applyExamTimerState(nextState);
+      return nextState;
+    } catch {
+      setTimerError("The exam state could not be saved. Please try again.");
+      return null;
+    }
+  }, [applyExamTimerState]);
 
   const recordViolation = useCallback((type) => {
     const now = Date.now();
@@ -170,8 +227,13 @@ function App() {
       mountedRef.current = false;
       requestInFlightRef.current = false;
       examActiveRef.current = false;
+      examStartInFlightRef.current = false;
       requestIdRef.current += 1;
       stopSnapshotTimer(captureTimerRef, captureGenerationRef);
+      if (examTimerIntervalRef.current !== null) {
+        clearInterval(examTimerIntervalRef.current);
+        examTimerIntervalRef.current = null;
+      }
       const stream = streamRef.current;
       streamRef.current = null;
       imageCaptureRef.current = null;
@@ -181,6 +243,53 @@ function App() {
       if (video) video.srcObject = null;
     };
   }, []);
+
+  useEffect(() => {
+    if (!window.electronAPI?.onExamStateChange) return undefined;
+
+    let subscribed = true;
+    const handleExamStateChange = (state) => {
+      if (subscribed) applyExamTimerState(state);
+    };
+    const unsubscribe = window.electronAPI.onExamStateChange(handleExamStateChange);
+    window.electronAPI
+      .getExamTimer?.()
+      .then((state) => handleExamStateChange(state))
+      .catch(() => setTimerError("The saved exam timer could not be loaded."));
+
+    return () => {
+      subscribed = false;
+      unsubscribe?.();
+    };
+  }, [applyExamTimerState]);
+
+  useEffect(() => {
+    if (examTimerIntervalRef.current !== null) {
+      clearInterval(examTimerIntervalRef.current);
+      examTimerIntervalRef.current = null;
+    }
+    if (examTimerState.status !== "active" || !examTimerState.deadlineAt) {
+      return undefined;
+    }
+
+    const updateRemainingTime = () => {
+      const nextRemainingMs = Math.max(0, examTimerState.deadlineAt - Date.now());
+      setRemainingMs((current) =>
+        current === nextRemainingMs ? current : nextRemainingMs,
+      );
+    };
+
+    // The persisted deadline, not interval count, decides when the exam expires.
+    updateRemainingTime();
+    examTimerIntervalRef.current = setInterval(updateRemainingTime, 1000);
+
+    return () => {
+      if (examTimerIntervalRef.current !== null) {
+        clearInterval(examTimerIntervalRef.current);
+        examTimerIntervalRef.current = null;
+      }
+    };
+  }, [examTimerState.status, examTimerState.deadlineAt]);
 
   async function requestCamera() {
     if (requestInFlightRef.current || streamRef.current) return;
@@ -231,6 +340,7 @@ function App() {
       stream.getVideoTracks()[0].addEventListener("ended", () => {
         if (!mountedRef.current || streamRef.current !== stream) return;
         stopSnapshotTimer(captureTimerRef, captureGenerationRef);
+        void finishExam("cancelled");
         examActiveRef.current = false;
         setExamActive(false);
         streamRef.current = null;
@@ -259,6 +369,7 @@ function App() {
     requestInFlightRef.current = false;
     requestIdRef.current += 1;
     stopSnapshotTimer(captureTimerRef, captureGenerationRef);
+    if (examActiveRef.current) void finishExam("cancelled");
     examActiveRef.current = false;
     setExamActive(false);
     const stream = streamRef.current;
@@ -292,7 +403,13 @@ function App() {
   }
 
   useEffect(() => {
-    if (!examActive || !rulesAccepted || !cameraReady || !streamRef.current) {
+    if (
+      !examActive ||
+      examTimerState.status !== "active" ||
+      !rulesAccepted ||
+      !cameraReady ||
+      !streamRef.current
+    ) {
       return undefined;
     }
 
@@ -338,24 +455,31 @@ function App() {
       if (captureTimerRef.current === timer) captureTimerRef.current = null;
       captureGenerationRef.current += 1;
     };
-  }, [cameraReady, examActive, rulesAccepted]);
+  }, [cameraReady, examActive, examTimerState.status, rulesAccepted]);
 
-  function startExam() {
+  async function startExam() {
+    if (examStartInFlightRef.current || examTimerState.status === "active") return;
     if (!cameraReady || !rulesAccepted || !fullscreen) {
       setFullscreenError("Enter fullscreen before starting the exam.");
       return;
     }
-    examActiveRef.current = true;
-    setCaptureStatus("Starting local snapshots every five seconds…");
-    setExamActive(true);
+
+    examStartInFlightRef.current = true;
+    setTimerError("");
+    try {
+      const nextState = await window.electronAPI.startExamTimer();
+      applyExamTimerState(nextState);
+      setCaptureStatus("Exam active; snapshots save locally every five seconds.");
+    } catch {
+      setTimerError("The exam could not be started. Please try again.");
+    } finally {
+      examStartInFlightRef.current = false;
+    }
   }
 
-  function endExam() {
-    stopSnapshotTimer(captureTimerRef, captureGenerationRef);
-    examActiveRef.current = false;
-    setExamActive(false);
-    setFullscreenRecoveryRequired(false);
-    setCaptureStatus("Snapshots stopped because the exam ended.");
+  async function endExam() {
+    const nextState = await finishExam("manual");
+    if (nextState) setCaptureStatus("Snapshots stopped because the exam ended.");
   }
 
   return (
@@ -483,10 +607,42 @@ function App() {
             <h2 className="text-xl font-semibold">Proctoring rules</h2>
             <p className="mt-2 text-sm text-slate-400">
               During the active exam, one camera snapshot is saved locally
-              every five seconds. Snapshots stop when you end the exam or the
-              camera becomes unavailable.
+              every five seconds. The exam runs for 60 minutes by default;
+              its deadline is saved locally so a refresh cannot reset it.
             </p>
           </div>
+
+          {(examTimerState.status === "active" ||
+            examTimerState.status === "submitted") && (
+            <div
+              aria-live="polite"
+              className="rounded-lg border border-slate-700 bg-slate-950/60 p-4"
+            >
+              <p className="text-sm font-medium">
+                {examTimerState.status === "active"
+                  ? "Time remaining"
+                  : "Exam complete"}
+              </p>
+              <p className="mt-1 font-mono text-2xl text-cyan-300">
+                {examTimerState.status === "active"
+                  ? formatTimeLeft(remainingMs)
+                  : examTimerState.completionReason === "time-expired"
+                    ? "00:00"
+                    : "Submitted"}
+              </p>
+              {examTimerState.status === "submitted" && (
+                <p className="mt-1 text-sm text-slate-400">
+                  This exam cannot be restarted from this window.
+                </p>
+              )}
+            </div>
+          )}
+
+          {timerError && (
+            <p aria-live="assertive" className="text-sm text-rose-300">
+              {timerError}
+            </p>
+          )}
 
           <label className="flex items-start gap-3 text-sm text-slate-300">
             <input
@@ -503,7 +659,7 @@ function App() {
           </label>
 
           <div className="flex flex-wrap items-center gap-3">
-            {!examActive ? (
+            {examTimerState.status === "idle" ? (
               <button
                 type="button"
                 onClick={startExam}
@@ -512,7 +668,7 @@ function App() {
               >
                 Start proctored exam
               </button>
-            ) : (
+            ) : examTimerState.status === "active" ? (
               <button
                 type="button"
                 onClick={endExam}
@@ -520,6 +676,10 @@ function App() {
               >
                 End exam
               </button>
+            ) : (
+              <p className="text-sm font-medium text-slate-300">
+                This exam has already been submitted.
+              </p>
             )}
             <p aria-live="polite" className="text-sm text-slate-400">
               {examActive ? captureStatus : "Snapshots are currently off."}

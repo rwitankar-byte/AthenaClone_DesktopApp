@@ -7,6 +7,10 @@ const IPC_CHANNELS = Object.freeze({
   saveSnapshot: "proctoring:save-snapshot",
   getWindowState: "window:get-state",
   windowStateChanged: "window:state-changed",
+  startExamTimer: "exam:start-timer",
+  getExamTimer: "exam:get-timer",
+  finishExam: "exam:finish",
+  examStateChanged: "exam:state-changed",
 });
 
 // React sees only these methods; Node.js and raw ipcRenderer remain private here.
@@ -20,6 +24,14 @@ contextBridge.exposeInMainWorld("electronAPI", {
     return ipcRenderer.invoke(IPC_CHANNELS.setFullscreen, enabled);
   },
   getWindowState: () => ipcRenderer.invoke(IPC_CHANNELS.getWindowState),
+  startExamTimer: () => ipcRenderer.invoke(IPC_CHANNELS.startExamTimer),
+  getExamTimer: () => ipcRenderer.invoke(IPC_CHANNELS.getExamTimer),
+  finishExam: (reason) => {
+    if (!["manual", "cancelled", "time-expired"].includes(reason)) {
+      return Promise.reject(new TypeError("Invalid exam completion reason"));
+    }
+    return ipcRenderer.invoke(IPC_CHANNELS.finishExam, reason);
+  },
   onWindowStateChange: (callback) => {
     if (typeof callback !== "function") {
       throw new TypeError("onWindowStateChange requires a callback");
@@ -28,6 +40,15 @@ contextBridge.exposeInMainWorld("electronAPI", {
     const listener = (_event, state) => callback(state);
     ipcRenderer.on(IPC_CHANNELS.windowStateChanged, listener);
     return () => ipcRenderer.removeListener(IPC_CHANNELS.windowStateChanged, listener);
+  },
+  onExamStateChange: (callback) => {
+    if (typeof callback !== "function") {
+      throw new TypeError("onExamStateChange requires a callback");
+    }
+
+    const listener = (_event, state) => callback(state);
+    ipcRenderer.on(IPC_CHANNELS.examStateChanged, listener);
+    return () => ipcRenderer.removeListener(IPC_CHANNELS.examStateChanged, listener);
   },
   saveSnapshot: (payload) => {
     if (!(payload instanceof ArrayBuffer)) {

@@ -9,7 +9,7 @@
     "dev:electron": "electron .",
     "build": "vite build",
     "lint": "eslint .",
-    "test": "node --test electron/snapshot.test.cjs",
+    "test": "node --test electron/*.test.cjs",
     "preview": "vite preview"
   },
   "dependencies": {

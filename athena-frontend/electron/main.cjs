@@ -1,5 +1,12 @@
 const { BrowserWindow, app, ipcMain } = require("electron");
+const fs = require("node:fs");
 const path = require("node:path");
+const {
+  completeTimerState,
+  createTimerState,
+  getRemainingMs,
+  isExpired,
+} = require("./exam-timer.cjs");
 const { saveSnapshot } = require("./snapshot.cjs");
 
 const IPC_CHANNELS = Object.freeze({
@@ -8,10 +15,96 @@ const IPC_CHANNELS = Object.freeze({
   saveSnapshot: "proctoring:save-snapshot",
   getWindowState: "window:get-state",
   windowStateChanged: "window:state-changed",
+  startExamTimer: "exam:start-timer",
+  getExamTimer: "exam:get-timer",
+  finishExam: "exam:finish",
+  examStateChanged: "exam:state-changed",
 });
 
 let mainWindow = null;
 let ipcHandlersRegistered = false;
+let examTimerState = null;
+let examTimerTimeout = null;
+
+function examTimerFilePath() {
+  return path.join(app.getPath("userData"), "exam-timer-state.json");
+}
+
+function persistExamTimer() {
+  const filePath = examTimerFilePath();
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, JSON.stringify(examTimerState), "utf8");
+}
+
+function clearExamTimerTimeout() {
+  if (examTimerTimeout) clearTimeout(examTimerTimeout);
+  examTimerTimeout = null;
+}
+
+function rendererExamTimerState() {
+  return {
+    ...examTimerState,
+    remainingMs: getRemainingMs(examTimerState),
+  };
+}
+
+function sendExamTimerState() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send(
+    IPC_CHANNELS.examStateChanged,
+    rendererExamTimerState(),
+  );
+}
+
+function completeExam(reason) {
+  if (!examTimerState || examTimerState.status !== "active") {
+    return examTimerState;
+  }
+
+  examTimerState = completeTimerState(examTimerState, reason);
+  clearExamTimerTimeout();
+  persistExamTimer();
+  sendExamTimerState();
+  return examTimerState;
+}
+
+function scheduleExamTimer() {
+  clearExamTimerTimeout();
+  if (!examTimerState || examTimerState.status !== "active") return;
+
+  const remainingMs = getRemainingMs(examTimerState);
+  if (remainingMs === 0) {
+    completeExam("time-expired");
+    return;
+  }
+
+  // The deadline is authoritative; this timeout only wakes the main process
+  // so expiry is persisted and broadcast even if the renderer is refreshed.
+  examTimerTimeout = setTimeout(() => completeExam("time-expired"), remainingMs);
+}
+
+function loadExamTimer() {
+  try {
+    const stored = JSON.parse(fs.readFileSync(examTimerFilePath(), "utf8"));
+    if (!stored || (stored.status !== "active" && stored.status !== "submitted")) {
+      throw new Error("Invalid exam timer state");
+    }
+    examTimerState = stored;
+  } catch {
+    examTimerState = {
+      status: "idle",
+      startedAt: null,
+      deadlineAt: null,
+      durationMs: null,
+      completedAt: null,
+      completionReason: null,
+      rulesAccepted: false,
+    };
+  }
+
+  if (isExpired(examTimerState)) completeExam("time-expired");
+  else scheduleExamTimer();
+}
 
 function assertTrustedSender(event) {
   if (
@@ -65,6 +158,42 @@ function registerIpcHandlers() {
     assertTrustedSender(event);
     await saveSnapshot(app, payload);
     return { saved: true };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.startExamTimer, (event, ...args) => {
+    assertTrustedSender(event);
+    if (args.length !== 0) throw new TypeError("startExamTimer accepts no arguments");
+    if (examTimerState.status === "active") return rendererExamTimerState();
+    if (examTimerState.status === "submitted") {
+      throw new Error("This exam has already been completed");
+    }
+
+    // The renderer cannot choose a deadline or duration; main owns both.
+    examTimerState = createTimerState();
+    persistExamTimer();
+    scheduleExamTimer();
+    sendExamTimerState();
+    return rendererExamTimerState();
+  });
+
+  ipcMain.handle(IPC_CHANNELS.getExamTimer, (event, ...args) => {
+    assertTrustedSender(event);
+    if (args.length !== 0) throw new TypeError("getExamTimer accepts no arguments");
+    return rendererExamTimerState();
+  });
+
+  ipcMain.handle(IPC_CHANNELS.finishExam, (event, reason, ...args) => {
+    assertTrustedSender(event);
+    if (args.length !== 0) throw new TypeError("finishExam accepts one argument");
+    if (!["manual", "cancelled", "time-expired"].includes(reason)) {
+      throw new TypeError("Invalid exam completion reason");
+    }
+    if (reason === "time-expired" && !isExpired(examTimerState)) {
+      throw new Error("The exam deadline has not been reached");
+    }
+    // Once the deadline has passed, expiry wins over a concurrent manual action.
+    completeExam(isExpired(examTimerState) ? "time-expired" : reason);
+    return rendererExamTimerState();
   });
 
   ipcHandlersRegistered = true;
@@ -138,6 +267,7 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  loadExamTimer();
   registerIpcHandlers();
   createWindow();
 
