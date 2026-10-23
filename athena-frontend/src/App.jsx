@@ -3,6 +3,7 @@ import {
   getExamQuestionTotal,
   getExamQuestions,
   getExamSession,
+  recordExamEvent,
   saveExamAnswer,
   startExamSession,
   submitExamSession,
@@ -121,6 +122,10 @@ function App() {
   const submissionInFlightRef = useRef(false);
   const backendFinalizationPromiseRef = useRef(null);
   const lastViolationAtRef = useRef(new Map());
+  const eventRetryTimersRef = useRef(new Set());
+  const lastCaptureFailureAtRef = useRef(0);
+  const examStartEventSessionRef = useRef("");
+  const submissionEventKeysRef = useRef(new Set());
   const [cameraStatus, setCameraStatus] = useState(
     CAMERA_STATUS.NOT_CONFIGURED,
   );
@@ -265,6 +270,30 @@ function App() {
     }
   }, [examTimerState.status, finalizeBackendSession, finishExam]);
 
+  const recordExamEventWithRetry = useCallback((eventType, metadata = {}) => {
+    if (!sessionId) return;
+    let attempt = 0;
+    const send = () => {
+      attempt += 1;
+      recordExamEvent({ sessionId, eventType, metadata }).catch(() => {
+        if (attempt >= 3) return;
+        const timer = setTimeout(() => {
+          eventRetryTimersRef.current.delete(timer);
+          send();
+        }, attempt * 500);
+        eventRetryTimersRef.current.add(timer);
+      });
+    };
+    send();
+  }, [sessionId]);
+
+  const recordSubmissionEvent = useCallback((eventType, metadata) => {
+    const key = `${sessionId}:${eventType}`;
+    if (!sessionId || submissionEventKeysRef.current.has(key)) return;
+    submissionEventKeysRef.current.add(key);
+    recordExamEventWithRetry(eventType, metadata);
+  }, [recordExamEventWithRetry, sessionId]);
+
   const recordViolation = useCallback((type) => {
     const now = Date.now();
     const lastDetectedAt = lastViolationAtRef.current.get(type) || 0;
@@ -284,11 +313,24 @@ function App() {
         confirmed: false,
       },
     ]);
-  }, []);
+    recordExamEventWithRetry(type, { source: "window-state" });
+  }, [recordExamEventWithRetry]);
 
   useEffect(() => {
     examActiveRef.current = examActive;
   }, [examActive]);
+
+  useEffect(() => {
+    if (
+      examActive &&
+      examTimerState.status === "active" &&
+      sessionId &&
+      examStartEventSessionRef.current !== sessionId
+    ) {
+      examStartEventSessionRef.current = sessionId;
+      recordExamEventWithRetry("exam-start", { source: "renderer" });
+    }
+  }, [examActive, examTimerState.status, recordExamEventWithRetry, sessionId]);
 
   useEffect(() => {
     if (!window.electronAPI?.onWindowStateChange) return undefined;
@@ -328,6 +370,7 @@ function App() {
   useEffect(() => {
     mountedRef.current = true;
     const video = videoRef.current;
+    const eventRetryTimers = eventRetryTimersRef.current;
 
     return () => {
       mountedRef.current = false;
@@ -336,6 +379,8 @@ function App() {
       examStartInFlightRef.current = false;
       requestIdRef.current += 1;
       stopSnapshotTimer(captureTimerRef, captureGenerationRef);
+      for (const timer of eventRetryTimers) clearTimeout(timer);
+      eventRetryTimers.clear();
       if (examTimerIntervalRef.current !== null) {
         clearInterval(examTimerIntervalRef.current);
         examTimerIntervalRef.current = null;
@@ -389,6 +434,7 @@ function App() {
             wrong: session.wrong,
           });
           setFinalizationStatus("succeeded");
+          if (examTimerState.status === "active") void finishExam("manual");
         }
       })
       .catch((error) => {
@@ -400,7 +446,7 @@ function App() {
     return () => {
       current = false;
     };
-  }, [sessionId]);
+  }, [examTimerState.status, finishExam, sessionId]);
 
   useEffect(() => {
     if (
@@ -444,6 +490,14 @@ function App() {
     const retry = setTimeout(() => void submitBackendSession(), 0);
     return () => clearTimeout(retry);
   }, [examTimerState.status, sessionId, submitBackendSession]);
+
+  useEffect(() => {
+    if (examTimerState.status !== "submitted" || finalizationStatus !== "succeeded") return;
+    if (examTimerState.completionReason === "time-expired") {
+      recordSubmissionEvent("timer-expired", { source: "main-process" });
+    }
+    recordSubmissionEvent("exam-submission", { source: "renderer" });
+  }, [examTimerState.completionReason, examTimerState.status, finalizationStatus, recordSubmissionEvent]);
 
   useEffect(() => {
     if (examTimerIntervalRef.current !== null) {
@@ -522,6 +576,7 @@ function App() {
       stream.getVideoTracks()[0].addEventListener("ended", () => {
         if (!mountedRef.current || streamRef.current !== stream) return;
         stopSnapshotTimer(captureTimerRef, captureGenerationRef);
+        recordExamEventWithRetry("camera-stream-interrupted", { reason: "track-ended" });
         void finishExam("cancelled");
         examActiveRef.current = false;
         setExamActive(false);
@@ -534,6 +589,7 @@ function App() {
 
       setCameraStatus(CAMERA_STATUS.READY);
       setStatusMessage("Camera is ready for the proctored exam.");
+      recordExamEventWithRetry("camera-access-granted", { source: "user-action" });
     } catch (error) {
       if (!mountedRef.current || requestId !== requestIdRef.current) return;
       const stream = streamRef.current;
@@ -542,6 +598,10 @@ function App() {
       if (videoRef.current) videoRef.current.srcObject = null;
       setCameraStatus(CAMERA_STATUS.UNAVAILABLE);
       setStatusMessage(getCameraErrorMessage(error));
+      const eventType = ["NotAllowedError", "PermissionDeniedError"].includes(error?.name)
+        ? "camera-access-denied"
+        : "camera-stream-interrupted";
+      recordExamEventWithRetry(eventType, { reason: error?.name || "unknown" });
     } finally {
       if (requestId === requestIdRef.current) requestInFlightRef.current = false;
     }
@@ -621,6 +681,10 @@ function App() {
       } catch {
         if (!stopped && generation === captureGenerationRef.current) {
           setCaptureStatus("Snapshot capture failed; the exam can continue.");
+          if (Date.now() - lastCaptureFailureAtRef.current >= 30000) {
+            lastCaptureFailureAtRef.current = Date.now();
+            recordExamEventWithRetry("capture-failure", { reason: "capture-or-save-failed" });
+          }
         }
       } finally {
         captureInFlightRef.current = false;
@@ -638,7 +702,14 @@ function App() {
       if (captureTimerRef.current === timer) captureTimerRef.current = null;
       captureGenerationRef.current += 1;
     };
-  }, [backendStatus, cameraReady, examActive, examTimerState.status, rulesAccepted]);
+  }, [
+    backendStatus,
+    cameraReady,
+    examActive,
+    examTimerState.status,
+    recordExamEventWithRetry,
+    rulesAccepted,
+  ]);
 
   async function startExam() {
     if (examStartInFlightRef.current || examTimerState.status === "active") return;
@@ -729,6 +800,7 @@ function App() {
       if (!nextState) throw new Error("Local exam finalization failed");
       setFinalizationStatus("succeeded");
       setCaptureStatus("Exam submitted; snapshots stopped.");
+      recordSubmissionEvent("exam-submission", { source: "renderer" });
     } catch (error) {
       setFinalizationStatus("failed");
       setQuestionError(`Exam submission failed: ${error.message}`);

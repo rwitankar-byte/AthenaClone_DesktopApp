@@ -46,6 +46,60 @@ function validateQuestionId(value) {
   return questionId;
 }
 
+const EVENT_CATEGORIES = Object.freeze({
+  "camera-access-granted": "technical",
+  "camera-access-denied": "technical",
+  "camera-stream-interrupted": "technical",
+  "capture-failure": "technical",
+  "fullscreen-exit": "policy-signal",
+  "window-focus-loss": "policy-signal",
+  "exam-start": "lifecycle",
+  "timer-expired": "lifecycle",
+  "exam-submission": "lifecycle",
+});
+const MAX_EVENTS_PER_SESSION = 1000;
+
+function validateEvent(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    throw new HttpError(400, "INVALID_EVENT", "event is invalid");
+  }
+  const eventId = requiredText(body.eventId, "eventId", 80);
+  if (!/^[0-9a-f-]{36}$/i.test(eventId)) {
+    throw new HttpError(400, "INVALID_EVENT", "eventId is invalid");
+  }
+  const sessionId = validateSessionId(body.sessionId);
+  const eventType = requiredText(body.eventType, "eventType", 40);
+  if (!Object.hasOwn(EVENT_CATEGORIES, eventType)) {
+    throw new HttpError(400, "INVALID_EVENT", "eventType is invalid");
+  }
+  const timestamp = new Date(body.timestamp);
+  if (
+    Number.isNaN(timestamp.getTime()) ||
+    Math.abs(Date.now() - timestamp.getTime()) > 24 * 60 * 60 * 1000
+  ) {
+    throw new HttpError(400, "INVALID_EVENT", "timestamp is invalid");
+  }
+  const metadata = body.metadata === undefined ? {} : body.metadata;
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+    throw new HttpError(400, "INVALID_EVENT", "metadata is invalid");
+  }
+  const allowedMetadata = new Set(["source", "reason", "platform", "errorName"]);
+  const cleanMetadata = {};
+  for (const [key, value] of Object.entries(metadata)) {
+    if (!allowedMetadata.has(key) || typeof value !== "string" || value.length > 120) {
+      throw new HttpError(400, "INVALID_EVENT", "metadata is invalid");
+    }
+    cleanMetadata[key] = requiredText(value, `metadata.${key}`, 120);
+  }
+  return {
+    eventId,
+    sessionId,
+    eventType,
+    timestamp: timestamp.toISOString(),
+    metadata: cleanMetadata,
+  };
+}
+
 function publicQuestion(question) {
   return { id: question.id, question: question.question, options: question.options };
 }
@@ -62,6 +116,14 @@ function publicSession(session) {
     correct: session.correct,
     wrong: session.wrong,
     answers: session.answers.map(({ isCorrect, ...answer }) => answer),
+    events: (session.events || []).map(({ eventId, sessionId, eventType, category, timestamp, metadata }) => ({
+      eventId,
+      sessionId,
+      eventType,
+      category,
+      timestamp,
+      metadata,
+    })),
   };
 }
 
@@ -129,6 +191,7 @@ function createExamApp({ dataDir = path.join(__dirname, "data") } = {}) {
         correct: 0,
         wrong: 0,
         answers: [],
+        events: [],
       };
       await sessionStore.update((sessions) => sessions.push(session));
       res.status(201).json({ message: "Exam session started", sessionId: session.sessionId });
@@ -218,6 +281,33 @@ function createExamApp({ dataDir = path.join(__dirname, "data") } = {}) {
       });
       const { isCorrect: _isCorrect, ...publicResult } = result;
       res.json({ message: "Answer saved", ...publicResult });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/exam/event", async (req, res, next) => {
+    try {
+      const event = validateEvent(req.body);
+      const result = await sessionStore.update((sessions) => {
+        const session = sessions.find((item) => item.sessionId === event.sessionId);
+        if (!session) throw new HttpError(404, "SESSION_NOT_FOUND", "Session not found");
+        if (session.status !== "in-progress") {
+          throw new HttpError(409, "SESSION_COMPLETED", "Exam is already submitted");
+        }
+        session.events ||= [];
+        const existing = session.events.find((item) => item.eventId === event.eventId);
+        if (existing) return { event: existing, duplicate: true };
+        const storedEvent = {
+          ...event,
+          category: EVENT_CATEGORIES[event.eventType],
+          recordedAt: new Date().toISOString(),
+        };
+        session.events.push(storedEvent);
+        if (session.events.length > MAX_EVENTS_PER_SESSION) session.events.shift();
+        return { event: storedEvent, duplicate: false };
+      });
+      res.status(result.duplicate ? 200 : 201).json(result);
     } catch (error) {
       next(error);
     }

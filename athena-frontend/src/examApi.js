@@ -69,4 +69,17 @@ export function submitExamSession(sessionId) {
   });
 }
 
+export function recordExamEvent({ sessionId, eventType, metadata = {} }) {
+  return request("/exam/event", {
+    method: "POST",
+    body: JSON.stringify({
+      eventId: crypto.randomUUID(),
+      sessionId,
+      eventType,
+      timestamp: new Date().toISOString(),
+      metadata,
+    }),
+  });
+}
+
 export { EXAM_BACKEND_URL };

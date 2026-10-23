@@ -1,4 +1,4 @@
-const { BrowserWindow, app, ipcMain } = require("electron");
+const { BrowserWindow, app, ipcMain, session } = require("electron");
 const fs = require("node:fs");
 const path = require("node:path");
 const {
@@ -266,9 +266,20 @@ function createWindow() {
   return mainWindow;
 }
 
+function configurePermissions() {
+  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
+    const allowed = permission === "media" && isAllowedNavigation(webContents.getURL());
+    callback(allowed);
+  });
+  session.defaultSession.setPermissionCheckHandler((webContents, permission) => {
+    return permission === "media" && isAllowedNavigation(webContents.getURL());
+  });
+}
+
 app.whenReady().then(() => {
   loadExamTimer();
   registerIpcHandlers();
+  configurePermissions();
   createWindow();
 
   // macOS apps stay open after their last window closes and recreate it on activate.

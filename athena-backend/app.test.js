@@ -45,12 +45,65 @@ test("creates a session and returns its public status", async () => {
     assert.equal(session.status, "in-progress");
     assert.equal(session.userId, "student-1");
     assert.deepEqual(session.answers, []);
+    assert.deepEqual(session.events, []);
     assert.equal(Object.hasOwn(session, "correctAnswer"), false);
 
     const questionResponse = await fetch(`${baseUrl}/exam/mcq/1`);
     const question = await questionResponse.json();
     assert.equal(questionResponse.status, 200);
     assert.equal(Object.hasOwn(question, "correctAnswer"), false);
+
+    const event = {
+      eventId: "2d8b7f42-1d9f-4f40-b7fa-2e0b1c7f2abc",
+      sessionId: started.sessionId,
+      eventType: "fullscreen-exit",
+      timestamp: new Date().toISOString(),
+      metadata: { source: "window-state" },
+    };
+    const firstEventResponse = await fetch(`${baseUrl}/exam/event`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(event),
+    });
+    const firstEvent = await firstEventResponse.json();
+    assert.equal(firstEventResponse.status, 201);
+    assert.equal(firstEvent.event.category, "policy-signal");
+
+    const duplicateEventResponse = await fetch(`${baseUrl}/exam/event`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(event),
+    });
+    const duplicateEvent = await duplicateEventResponse.json();
+    assert.equal(duplicateEventResponse.status, 200);
+    assert.equal(duplicateEvent.duplicate, true);
+
+    const invalidEventResponse = await fetch(`${baseUrl}/exam/event`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...event, eventId: "bad", eventType: "secret-data" }),
+    });
+    const invalidEvent = await invalidEventResponse.json();
+    assert.equal(invalidEventResponse.status, 400);
+    assert.equal(invalidEvent.error.code, "INVALID_EVENT");
+
+    const staleEventResponse = await fetch(`${baseUrl}/exam/event`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        ...event,
+        eventId: "603d9a20-49de-4b23-a61e-fc4f7ce5048e",
+        timestamp: new Date(0).toISOString(),
+      }),
+    });
+    assert.equal(staleEventResponse.status, 400);
+    assert.equal((await staleEventResponse.json()).error.code, "INVALID_EVENT");
+
+    const sessionWithEvent = await (
+      await fetch(`${baseUrl}/exam/session/${encodeURIComponent(started.sessionId)}`)
+    ).json();
+    assert.equal(sessionWithEvent.events.length, 1);
+    assert.equal(sessionWithEvent.events[0].eventId, event.eventId);
 
     const firstAnswerResponse = await fetch(`${baseUrl}/exam/answer`, {
       method: "POST",
@@ -113,6 +166,37 @@ test("creates a session and returns its public status", async () => {
     ).json();
     assert.equal(submittedSession.status, "submitted");
     assert.ok(submittedSession.submittedAt);
+
+    const lateEventResponse = await fetch(`${baseUrl}/exam/event`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...event, eventId: "603d9a20-49de-4b23-a61e-fc4f7ce5048e" }),
+    });
+    assert.equal(lateEventResponse.status, 409);
+  } finally {
+    await new Promise((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("returns a structured error when event persistence is unavailable", async () => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "athena-backend-events-"));
+  await fs.writeFile(path.join(dataDir, "questions.json"), "[]");
+  await fs.mkdir(path.join(dataDir, "sessions.json"));
+  const server = createExamApp({ dataDir }).listen(0);
+  await new Promise((resolve) => server.once("listening", resolve));
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/exam/start`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ userId: "student-1", name: "Test Student" }),
+    });
+    const body = await response.json();
+    assert.equal(response.status, 500);
+    assert.equal(body.error.code, "DATASTORE_UNAVAILABLE");
   } finally {
     await new Promise((resolve, reject) =>
       server.close((error) => (error ? reject(error) : resolve())),
